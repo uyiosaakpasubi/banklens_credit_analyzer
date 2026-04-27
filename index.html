@@ -304,7 +304,7 @@ const MONTHS = {Jan:0,Feb:1,Mar:2,Apr:3,May:4,Jun:5,Jul:6,Aug:7,Sep:8,Oct:9,Nov:
 
 const FNAMES = {opay:'OPay Wallet',altbank:'Alternative Bank',stanbic:'Stanbic IBTC',
   gtbank:'GTBank',access:'Access Bank',kuda:'Kuda Bank',providus:'ProvidusBank',
-  wema:'Wema Bank',tajbank:'TAJBank',alat:'Wema Bank (ALAT)',alatbiz:'Wema Bank (ALAT Business)',generic:'Unknown Bank (generic parse)'};
+  wema:'Wema Bank',tajbank:'TAJBank',alat:'Wema Bank (ALAT)',alatbiz:'Wema Bank (ALAT Business)',keystone:'Keystone Bank',generic:'Unknown Bank (generic parse)'};
 
 const CAT_CFG = {
   'Salary':       {color:'#2A5C45',bg:'#EAF3EE'},
@@ -469,6 +469,7 @@ function detectFormat(text) {
   if (/DIAMONDXTRA/i.test(t) || /Wema\s*Bank/i.test(t) ||
      (/TOTAL\s*WITHDRAWALS/i.test(t) && /TOTAL\s*LODGEMENTS/i.test(t))) return 'wema';
   if (/TAJBank/i.test(t) || /tajconnect@tajbank/i.test(t)) return 'tajbank';
+  if (/keystonebankng\.com/i.test(t) || /Keystone\s*Bank/i.test(t)) return 'keystone';
   // Wema ALAT Business (Balance-first column layout, numeric DD-MM-YYYY dates)
   if (/Opening\s*Bal:/i.test(t) && /MY\s*BUSINESS\s*ACCOUNT/i.test(t)) return 'alatbiz';
 
@@ -528,6 +529,23 @@ function extractCoverStats(text, fmt) {
     acctNum:(()=>{ const m=text.match(/\b(\d{10})\b/); return m?m[1]:''; })(),
     period:(()=>{ const m=text.match(/(\w{3}\s+\d{2}\s+\d{4})\s*-\s*(\w{3}\s+\d{2}\s+\d{4})/i); return m?`${m[1]} – ${m[2]}`:''; })(),
   };
+
+  if (fmt === 'keystone') {
+    const nameMatch = text.match(/Account\s*Name\s*\n([^\n]+)/i);
+    const numMatch  = text.match(/Account\s*No\.\s*-\s*(\d+)/i);
+    const periodM   = text.match(/Summary\s*Statement\s*for\s*([^\n]+)\s*To\s*([^\n]+)/i);
+    return {
+      opening:  after(/Opening\s*Balance\s*-/i),
+      closing:  after(/Closing\s*Balance\s*-/i),
+      statedDr: after(/Total\s*Debits\s*-/i),
+      statedCr: after(/Total\s*Credits\s*-/i),
+      drCount:  null,
+      crCount:  null,
+      acctName: nameMatch ? nameMatch[1].trim() : '',
+      acctNum:  numMatch  ? numMatch[1] : '',
+      period:   periodM ? `${periodM[1].trim()} – ${periodM[2].trim()}` : '',
+    };
+  }
 
   if (fmt === 'alatbiz') {
     const nameMatch = text.match(/Acct\s*Name:\s*([^\n]+)/i);
@@ -844,6 +862,44 @@ function parseTajBank(lines, opening) {
 }
 
 // ── WEMA BANK (ALAT for Business): DD-Mon-YYYY, Credit/Debit/Balance ──
+function parseKeystone(lines, opening) {
+  // Keystone Bank: DDMmmYY DDMmmYY [narration] [debit|credit] [balance] Txn Amount - NGN... [noise]
+  // Stream-order text gives: date date narration amount balance [continuation with NGN amounts]
+  // Strategy: anchor on DDMmmYY DDMmmYY, collect block to next anchor, split on 'Txn Amount'
+  // to remove continuation noise, then take last decimal amount as balance.
+  const MON    = '(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)';
+  const ANCHOR = new RegExp(`(\\d{2})(${MON})(\\d{2})\\s+\\d{2}${MON}\\d{2}`, 'g');
+  const AMTS   = /[\d,]+\.\d{2}/g;
+  const MONTHS = {Jan:0,Feb:1,Mar:2,Apr:3,May:4,Jun:5,Jul:6,Aug:7,Sep:8,Oct:9,Nov:10,Dec:11};
+  const records = [];
+
+  const fullStream = lines.join(' ');
+
+  const anchors = [];
+  let am;
+  ANCHOR.lastIndex = 0;
+  while ((am = ANCHOR.exec(fullStream)) !== null) {
+    const mon = am[2];
+    const date = new Date(Date.UTC(2000 + +am[3], MONTHS[mon], +am[1]));
+    if (!isNaN(date.getTime())) anchors.push({ pos: am.index, end: am.index + am[0].length, date });
+  }
+
+  if (anchors.length === 0) return [];
+
+  for (let i = 0; i < anchors.length; i++) {
+    const start = anchors[i].end;
+    const end   = i + 1 < anchors.length ? anchors[i + 1].pos : Math.min(start + 400, fullStream.length);
+    const block = fullStream.slice(start, end);
+    // Remove continuation noise after 'Txn Amount'
+    const clean = block.split('Txn Amount')[0];
+    const amts  = [...clean.matchAll(AMTS)].map(x => toNum(x[0]));
+    if (amts.length === 0) continue;
+    records.push({ date: anchors[i].date, balance: amts[amts.length - 1], narration: cleanNarr(clean) });
+  }
+
+  return buildTxns(records, opening);
+}
+
 function parseAlatBiz(lines, opening) {
   // Wema ALAT Business: coordinate extraction gives clean lines with format:
   // TranDate(DD-MM-YYYY) ValueDate(DD-MM-YYYY) [narration?] Ref Withdrawals Deposits Balance
@@ -1013,6 +1069,7 @@ function dispatch(lines, cs, fmt) {
     case 'tajbank': return parseTajBank(lines, op);
     case 'alat':    return parseAlat(lines, op);
     case 'alatbiz': return parseAlatBiz(lines, op);
+    case 'keystone': return parseKeystone(lines, op);
     case 'wema': {
       const wt = parseWema(lines, op);
       return wt.length > 0 ? wt : parseGeneric(lines, op);
@@ -1188,7 +1245,7 @@ async function analyse(file) {
     // ALAT: coordinate extraction loses balance column on multi-line narration pages.
     // Re-extract in PDF content stream order which preserves all columns adjacently.
     let dispatchLines = lines;
-    if (fmt === 'alat') {
+    if (fmt === 'alat' || fmt === 'keystone') {
       const streamText  = await extractTextStreamOrder(file);
       dispatchLines = streamText.split('\n');
     }
